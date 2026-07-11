@@ -1,0 +1,277 @@
+---
+title: "Spotify Song Success Predictions"
+author: "Kathleen Phan"
+date: "2026-07-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Introduction
+
+As someone who enjoys listening to many different types of music, I wondered what types of songs are universally considered as "hits". In this project I seek to answer this question, using audio features from Spotify's dataset to build predictive models that classify songs as hits (popularity score ≥ 70) or non-hits.
+
+The dataset includes audio features such as danceability, energy, tempo, and valence. I compare four classification models:
+
+-   Logistic Regression
+-   Classification Tree
+-   Random Forest
+-   LASSO Regression
+
+
+# 2. Load Libraries and Data
+
+```{r load}
+library(tidyverse)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(glmnet)
+library(pROC)
+
+# Load data — update filename if yours is different
+spotify <- read_csv("spotify-tracks-dataset.csv")
+```
+
+
+# 3. Data Cleaning and Preparation
+```{r clean}
+# Select relevant columns
+spotify_clean <- spotify %>%
+  select(popularity, danceability, energy, loudness, speechiness,
+         acousticness, instrumentalness, liveness, valence, tempo,
+         explicit, track_genre) %>%
+  drop_na()
+
+# Create binary response variable 
+spotify_clean <- spotify_clean %>%
+  mutate(  # add new 'hit' column 
+    hit = factor(ifelse(popularity >= 70, "hit", "not_hit")),  #hit = 1 if popularity >= 70
+    explicit = factor(explicit)
+  ) %>%
+  select(-popularity)  # remove popularity since it defines the response
+
+# Check class balance
+table(spotify_clean$hit)
+prop.table(table(spotify_clean$hit))
+```
+
+# 4. Exploratory Data Analysis
+
+```{r eda of audio features}
+# Distribution of key audio features 
+spotify_clean %>%
+  pivot_longer(cols = c(danceability, energy, valence, tempo),  #reformat columns into rows for ggplot ease
+               names_to = "feature", values_to = "value") %>%
+  ggplot(aes(x = value, fill = hit)) +
+  geom_density(alpha = 0.5) +  # transparent density curve 
+  facet_wrap(~feature, scales = "free") +  # creates separate plots 
+  scale_fill_manual(values = c("hit" = "#FFADC7", "not_hit" = "#535353")) +
+  labs(title = "Audio Feature Distributions: Hit vs Not Hit",
+       x = "Value", y = "Density", fill = "Label") +
+  theme_minimal()  #light gridlines, white bkg
+```
+
+```{r eda of hits by genre}
+# Hit rate by genre (top 15 genres)
+spotify_clean %>%
+  group_by(track_genre) %>%
+  summarise(hit_rate = mean(hit == "hit"), count = n()) %>%
+  filter(count >= 100) %>%
+  arrange(desc(hit_rate)) %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(x = reorder(track_genre, hit_rate), y = hit_rate)) +
+  geom_col(fill = "#F6C8D1") +
+  coord_flip() +  # flip x and y, helps readability
+  labs(title = "Hit Rate by Genre (Top 15)",
+       x = "Genre", y = "Proportion of Hits") +
+  theme_minimal()
+```
+
+```{r eda of correlation btwn features}
+# Correlation between numeric features
+spotify_clean %>%
+  select(where(is.numeric)) %>%
+  cor() %>%
+  round(2)
+
+library(corrplot)
+spotify_clean %>%
+  select(where(is.numeric)) %>%
+  cor() %>%
+  corrplot(method = "color", type = "upper", tl.col = "black")
+```
+
+
+
+# 5. Train/Test Split
+```{r split}
+set.seed(123)
+
+train_index <- createDataPartition(spotify_clean$hit, p = 0.8, list = FALSE)  # split data into 80% training 20% test
+train_data  <- spotify_clean[train_index, ]
+test_data   <- spotify_clean[-train_index, ]
+```
+
+
+# 6.1 Logistic Regression
+```{r logistic}
+log_model <- glm(hit ~ . - track_genre, 
+                 data = train_data, 
+                 family = binomial)
+summary(log_model)
+
+# Predictions
+log_probs <- predict(log_model, test_data, type = "response")  # assigns a probability to each set of predictors based on the logistic model
+log_preds <- factor(ifelse(log_probs > 0.5, "hit", "not_hit"))  # matchs prob to corresponding response
+
+# Confusion matrix
+confusionMatrix(log_preds, test_data$hit, positive = "hit")
+```
+
+# 6.2 Classification Tree
+```{r tree}
+tree_model <- rpart(hit ~ . - track_genre, 
+                    data = train_data, 
+                    method = "class")
+
+# Plot tree
+rpart.plot(tree_model, main = "Classification Tree: Hit Song Prediction")
+
+# Predictions
+tree_preds <- predict(tree_model, test_data, type = "class")  # response predictions
+
+# Confusion matrix
+confusionMatrix(tree_preds, test_data$hit, positive = "hit")
+```
+
+```{r balanced tree}
+set.seed(123)
+train_balanced <- downSample(x = train_data %>% select(-hit),  #randomly remove rows from 'hit' until same size as 'not hit'
+                             y = train_data$hit,
+                             yname = "hit")
+
+# Check balance
+table(train_data$hit)
+table(train_balanced$hit)
+
+# Refit tree using balanced data
+tree_model <- rpart(hit ~ . - track_genre,
+                    data = train_balanced,
+                    method = "class")
+
+rpart.plot(tree_model, main = "Classification Tree: Hit Song Prediction")
+```
+
+# 6.3 Random Forest
+```{r rf}
+set.seed(123)
+rf_model <- randomForest(hit ~ . - track_genre,
+                         data = train_data,
+                         ntree = 100,
+                         importance = TRUE)
+
+# Variable importance
+varImpPlot(rf_model, main = "Random Forest: Variable Importance")
+
+# Predictions
+rf_preds <- predict(rf_model, test_data)
+rf_probs <- predict(rf_model, test_data, type = "prob")[, "hit"]
+
+# Confusion matrix
+confusionMatrix(rf_preds, test_data$hit, positive = "hit")
+```
+
+# 6.4 LASSO Regression
+```{r lasso}
+# Prepare matrix format for glmnet
+x_train <- model.matrix(hit ~ . - track_genre, train_data)[, -1]
+y_train <- ifelse(train_data$hit == "hit", 1, 0)
+
+x_test  <- model.matrix(hit ~ . - track_genre, test_data)[, -1]
+
+# Cross-validated LASSO
+set.seed(123)
+lasso_cv <- cv.glmnet(x_train, y_train, alpha = 1, family = "binomial")
+
+# Best lambda
+plot(lasso_cv)
+bestlam=lasso_cv$lambda.min #choose lowest lambda
+bestlam
+
+# Predictions
+lasso_probs <- predict(lasso_cv, x_test, s = "lambda.min", type = "response")
+lasso_preds <- factor(ifelse(lasso_probs > 0.5, "hit", "not_hit"))
+
+# Confusion matrix
+confusionMatrix(lasso_preds, test_data$hit, positive = "hit")
+```
+
+# 7. Model Comparison
+```{r compare}
+# Function to extract metrics
+get_metrics <- function(preds, actual) {
+  cm <- confusionMatrix(preds, actual, positive = "hit")
+  data.frame(
+    Accuracy    = round(cm$overall["Accuracy"], 3),
+    Sensitivity = round(cm$byClass["Sensitivity"], 3),
+    Specificity = round(cm$byClass["Specificity"], 3),
+    Precision   = round(cm$byClass["Pos Pred Value"], 3)
+  )
+}
+
+# Combine all models
+results <- data.frame(
+  Model = c("Logistic", "Classification Tree", "Random Forest", "LASSO"),
+  rbind(
+    get_metrics(log_preds,   test_data$hit),
+    get_metrics(tree_preds,  test_data$hit),
+    get_metrics(rf_preds,    test_data$hit),
+    get_metrics(lasso_preds, test_data$hit)
+  )
+)
+
+rownames(results) <- NULL  # construct data frame
+results
+```
+
+```{r compare roc}
+# ROC curves
+roc_log   <- roc(test_data$hit, log_probs)
+roc_rf    <- roc(test_data$hit, rf_probs)
+roc_lasso <- roc(test_data$hit, as.vector(lasso_probs))
+
+plot(roc_log,   col = "#FFB3FA", lwd=4, main = "ROC Curves: Model Comparison")
+plot(roc_rf,    col = "#191414", add = TRUE)
+plot(roc_lasso, col = "#535353", add = TRUE, lty = 2)
+legend("bottomright",
+       legend = c(paste("Logistic"),
+                  paste("Random Forest"),
+                  paste("LASSO")),
+       col = c("#FFB3FA", "#191414", "#535353"),
+       lwd = 2)
+```
+
+------------------------------------------------------------------------
+
+# 8. Key findings
+
+-   Random Forest outperformed the other models. It produced more realistic, balanced scores for accuracy, sensitivity, specificity, and precision. 
+-   The least important predictors were valence and tempo. 
+-   Unsurprisingly, many popular songs tend to have high danceability and energy. 
+
+**Limitations:**
+
+-   "Hit" is defined by an arbitrary popularity threshold of 70. 
+-   The dataset may not reflect current trends, nor a wide range of different user preferences. This project investigates a very general, Western audience. 
+-   The class imbalance of disproportionately more non-hits than hits affected model performance. This explains why models such as classification trees and lasso has sensitivity scores of 0. These models over-predicted non-hits. 
+
+**Future work:**
+
+-   Investigate difference audiences from difference countries 
+-   Try genre-specific models to see if what makes a hit differs by genre
+
+
